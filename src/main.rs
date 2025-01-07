@@ -243,7 +243,7 @@ pub struct NetworkState {
 pub struct BitcoinCommand(pub [u8; 12]);
 
 impl BitcoinCommand {
-    pub fn from_str(s: &str) -> Option<BitcoinCommand> {
+    pub fn parse(s: &str) -> Option<BitcoinCommand> {
         if s.len() > 12 {
             None
         } else {
@@ -266,6 +266,12 @@ impl BitcoinCommand {
             }
         }
         String::from_utf8(printable).unwrap_or("#UNKNOWN".to_string())
+    }
+}
+
+impl fmt::Display for BitcoinCommand {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.to_string())
     }
 }
 
@@ -335,7 +341,7 @@ impl BitcoinPreamble {
     pub fn new(magic: u32, command: &str, length: u32, checksum: u32) -> BitcoinPreamble {
         BitcoinPreamble {
             magic: magic,
-            command: BitcoinCommand::from_str(command).unwrap(),
+            command: BitcoinCommand::parse(command).unwrap(),
             length: length,
             checksum: checksum,
         }
@@ -483,7 +489,14 @@ impl ForwardState {
     }
 
     pub fn reset_read(&mut self) -> Result<(), Error> {
-        debug!("Reset read! Filtered = {}", self.filtered);
+        if let Some(preamble) = self.preamble.as_ref() {
+            debug!(
+                "Reset read of message '{}': filtered = {}",
+                &preamble.command, &self.filtered
+            );
+        } else {
+            debug!("Reset read! Filtered = {}", self.filtered);
+        }
         if !self.filtered {
             if self.messages_to_send.len() > MAX_MSG_BUF_LEN {
                 error!("Too many messages from event {}", self.pair_event_id);
@@ -538,7 +551,7 @@ impl ForwardState {
         let msglen = u32::from_le_bytes(msg_len_bytes);
         let checksum = u32::from_le_bytes(msg_checksum_bytes);
 
-        info!("Received '{}' of {} bytes", command.to_string(), msglen);
+        info!("Received '{}' of {} bytes", &command, msglen);
 
         Some(BitcoinPreamble {
             magic: magic,
@@ -726,13 +739,15 @@ impl ForwardState {
         Ok(nr)
     }
 
-    /// Read preambles and messages until blocked
+    /// Read preambles and messages until blocked.
+    /// Only log filtering for downstream messages (i.e. messages sent to us from another peer)
     pub fn read_until_blocked<R: Read>(
         &mut self,
         magic: u32,
         input: &mut R,
-        allow_list: &Vec<BitcoinCommand>,
-        deny_list: &Vec<BitcoinCommand>,
+        allow_list: &[BitcoinCommand],
+        deny_list: &[BitcoinCommand],
+        is_downstream_message: bool,
     ) -> bool {
         let mut blocked = false;
         while !blocked {
@@ -751,12 +766,19 @@ impl ForwardState {
 
             if let Some(preamble) = self.preamble.as_ref() {
                 if !self.filtered
-                    && BitcoinProxy::filter(&self.preamble.as_ref().unwrap(), allow_list, deny_list)
+                    && BitcoinProxy::filter(
+                        &self.preamble.as_ref().unwrap(),
+                        allow_list,
+                        deny_list,
+                        is_downstream_message,
+                    )
                 {
                     self.filtered = true;
                 }
                 if !self.filtered && !self.filter_considered {
-                    info!("Allow message '{}'", preamble.command.to_string());
+                    if is_downstream_message {
+                        info!("Allow message '{}'", &preamble.command);
+                    }
                     self.filter_considered = true;
                 }
 
@@ -847,10 +869,16 @@ impl BitcoinProxy {
     /// Bitcoin message (returns true to filter; false not to).
     /// While this is not checked, either allow_list, deny_list, or both must have zero entries for
     /// this to work as expected.  If both lists are non-empty, the allow_list is preferred.
+    ///
+    /// Only log drops if is_downstream_message is true.
+    ///
+    /// Returns true if the message is to be filtered.
+    /// Returns false if not.
     pub fn filter(
         preamble: &BitcoinPreamble,
-        allow_list: &Vec<BitcoinCommand>,
-        deny_list: &Vec<BitcoinCommand>,
+        allow_list: &[BitcoinCommand],
+        deny_list: &[BitcoinCommand],
+        is_downstream_message: bool,
     ) -> bool {
         if allow_list.len() > 0 {
             for cmd in allow_list.iter() {
@@ -858,20 +886,18 @@ impl BitcoinProxy {
                     return false;
                 }
             }
-            info!(
-                "Drop non-allow-listed command '{:?}'",
-                preamble.command.to_string()
-            );
+            if is_downstream_message {
+                info!("Drop non-allow-listed command '{:?}'", &preamble.command,);
+            }
             return true;
         }
 
         if deny_list.len() > 0 {
             for cmd in deny_list.iter() {
                 if *cmd == preamble.command {
-                    info!(
-                        "Drop deny-listed command '{:?}'",
-                        preamble.command.to_string()
-                    );
+                    if is_downstream_message {
+                        info!("Drop deny-listed command '{:?}'", &preamble.command);
+                    }
                     return true;
                 }
             }
@@ -1003,15 +1029,19 @@ impl BitcoinProxy {
     /// needed.  Handles as many bytes as possible, bufferring them up into the inbound socket's
     /// forwarding state as needed.  Runs until encountering EWOULDBLOCK on both inbound and
     /// outbound.
+    ///
+    /// Logs message filtering if is_downstream_message is true
     pub fn process_socket_io<R: Read, W: Write>(
         magic: u32,
-        allow_list: &Vec<BitcoinCommand>,
-        deny_list: &Vec<BitcoinCommand>,
+        allow_list: &[BitcoinCommand],
+        deny_list: &[BitcoinCommand],
         inbound: &mut R,
         forward: &mut ForwardState,
         outbound: &mut W,
+        is_downstream_message: bool,
     ) -> bool {
-        if !forward.read_until_blocked(magic, inbound, allow_list, deny_list) {
+        if !forward.read_until_blocked(magic, inbound, allow_list, deny_list, is_downstream_message)
+        {
             return false;
         }
         if !forward.write_until_blocked(outbound) {
@@ -1052,6 +1082,7 @@ impl BitcoinProxy {
                             downstream,
                             forward,
                             upstream,
+                            true,
                         );
                         if !alive {
                             broken.push(*event_id);
@@ -1087,6 +1118,7 @@ impl BitcoinProxy {
                             upstream,
                             forward,
                             downstream,
+                            false,
                         );
                         if !alive {
                             broken.push(*event_id);
@@ -1276,7 +1308,7 @@ fn main() {
             usage(prog_name.clone());
         }
         info!("allow_list '{}'", message_name);
-        let bitcoin_cmd = BitcoinCommand::from_str(&message_name).unwrap();
+        let bitcoin_cmd = BitcoinCommand::parse(&message_name).unwrap();
         proxy.add_allow_list(bitcoin_cmd);
     }
 
@@ -1286,7 +1318,7 @@ fn main() {
             usage(prog_name.clone());
         }
         info!("deny_list '{}'", message_name);
-        let bitcoin_cmd = BitcoinCommand::from_str(&message_name).unwrap();
+        let bitcoin_cmd = BitcoinCommand::parse(&message_name).unwrap();
         proxy.add_deny_list(bitcoin_cmd);
     }
 
@@ -1483,6 +1515,7 @@ mod test {
                 &mut fd,
                 &mut f,
                 &mut output,
+                true,
             );
         }
 
@@ -1545,13 +1578,14 @@ mod test {
             BitcoinProxy::process_socket_io(
                 0xf9beb4d9,
                 &vec![
-                    BitcoinCommand::from_str("version").unwrap(),
-                    BitcoinCommand::from_str("ping").unwrap(),
+                    BitcoinCommand::parse("version").unwrap(),
+                    BitcoinCommand::parse("ping").unwrap(),
                 ],
                 &vec![],
                 &mut fd,
                 &mut f,
                 &mut output,
+                true,
             );
         }
 
@@ -1614,10 +1648,11 @@ mod test {
             BitcoinProxy::process_socket_io(
                 0xf9beb4d9,
                 &vec![],
-                &vec![BitcoinCommand::from_str("verack").unwrap()],
+                &vec![BitcoinCommand::parse("verack").unwrap()],
                 &mut fd,
                 &mut f,
                 &mut output,
+                true,
             );
         }
 
